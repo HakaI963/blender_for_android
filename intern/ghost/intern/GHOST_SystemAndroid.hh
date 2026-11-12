@@ -103,10 +103,7 @@ class GHOST_SystemAndroid : public GHOST_System {
    * of spinning: nothing can be presented, and burning a core on the largest
    * process on the device is what gets it killed out from under the user.
    */
-  bool hasValidWindow() const
-  {
-    return window_ && window_->getValid();
-  }
+  bool hasValidWindow() const;
 
   /**
    * Carry out the surface/focus command the glue deferred for this thread.

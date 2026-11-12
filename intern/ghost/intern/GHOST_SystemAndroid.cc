@@ -216,6 +216,11 @@ GHOST_TSuccess GHOST_SystemAndroid::disposeContext(GHOST_IContext *context)
   return GHOST_kSuccess;
 }
 
+bool GHOST_SystemAndroid::hasValidWindow() const
+{
+  return window_ && window_->getValid();
+}
+
 void GHOST_SystemAndroid::handleNativeWindowInit(android_app *app)
 {
   app_ = app;
