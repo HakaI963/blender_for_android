@@ -126,32 +126,36 @@ jobs:
 
       - name: Install host Python 3.13
         run: |
-          # Ubuntu 24.04 ships 3.12; the numpy cross-build and USD's Python
-          # support need the 3.13 the target profile ships (deps/build.sh also
-          # stages its own host interpreter when it builds Python itself, but
-          # the rest of the recipes expect one on the PATH).
-          # Retried: add-apt-repository talks to Launchpad over HTTPS and has
-          # been observed to die mid-read (IncompleteRead from launchpadlib),
-          # which fails a build that is otherwise healthy.
+          # Ubuntu 24.04 ships 3.12. This is a convenience, not a requirement:
+          # deps/build.sh stages its own 3.13 host interpreter when it builds the
+          # `python` recipe, and `python` sits before every recipe that asks for
+          # a host interpreter (numpy, certifi, pip, usd), so a warm-cache build
+          # runs nothing and a cold one builds the interpreter itself. A dead
+          # Launchpad (deadsnakes returns HTTP 500 GPGKeyTemporarilyNotFoundError
+          # fairly often) must not fail a build that would otherwise succeed, so
+          # every step here is best-effort and the last line never fails the job.
           if ! command -v python3.13; then
             for attempt in 1 2 3; do
               sudo add-apt-repository -y ppa:deadsnakes/ppa && break
               echo "[ci] add-apt-repository failed (attempt $attempt), retrying"
               sleep 15
-            done
+            done || echo "[ci] could not add the deadsnakes PPA; continuing without it"
             for attempt in 1 2 3; do
               sudo apt-get update && break
               echo "[ci] apt-get update failed (attempt $attempt), retrying"
               sleep 15
-            done
+            done || echo "[ci] apt-get update failed; continuing"
             for attempt in 1 2 3; do
               sudo apt-get install -y python3.13 python3.13-dev && break
               echo "[ci] apt-get install python3.13 failed (attempt $attempt), retrying"
               sleep 15
-            done
+            done || echo "[ci] python3.13 not installed; the dependency build stages its own"
           fi
-          command -v python3.13
-          python3.13 --version
+          if command -v python3.13; then
+            python3.13 --version
+          else
+            echo "[ci] no system python3.13; deps/build.sh will build one when it needs it"
+          fi
 
       - name: Fetch lib/linux_x64 (host libraries for the code generators)
         run: |
