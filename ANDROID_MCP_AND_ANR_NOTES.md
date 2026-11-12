@@ -1,6 +1,6 @@
 # MCP bridge + export-freeze fix + CI APK builds
 
-Four related changes to this fork, all requested together:
+Five related changes to this fork, all requested together:
 
 1. The Blender Lab **MCP bridge add-on** (v1.0.3) is bundled in the APK, enabled
    by default, and its network permission is permanently available.
@@ -10,6 +10,9 @@ Four related changes to this fork, all requested together:
 3. The APK is built by **GitHub Actions** ([.github/workflows/android-apk.yml](.github/workflows/android-apk.yml)),
    so no local gradle/NDK run is needed to produce an APK.
 4. The app runs **landscape** and **stays open in the background**.
+5. The bundled bridge add-on is fixed up for the realities of a phone:
+   frozen processes, port conflicts, a writable temp directory, and the
+   `bl_info` warning.
 
 ## 1. The MCP add-on, always active
 
@@ -139,3 +142,59 @@ is what "does not stay open" is. Two halves:
 Also fixed on the way: a reborn surface that arrives before the window exists is
 no longer dropped (the pending command retries) — that race is what left a black
 window after a quick app-switch during startup.
+
+## 5. Making the bundled bridge usable on a phone
+
+Five problems found while driving the port from a PC-side MCP client, and what
+changed for each.
+
+**Port conflict, silently skipped.** `_autostart_timer` used to catch the bind
+failure and store it in a string only the Preferences panel shows, so an
+auto-start that did nothing left no trace anywhere. Now the failure is printed
+to the console (logcat, tag `blender`), and a new preference pair --
+*Port Fallback* / *Fallback Range* -- makes it try the next free port above the
+preferred one and log which port it actually took. Two bridges can therefore
+coexist: whichever held the preferred port keeps it, and the other reports its
+own. With fallback off the original error is still printed rather than dropped.
+
+**A frozen process answers nothing.** Android moves a backgrounded app into a
+cpuset with no CPU. The listening socket stays open, so a client connects,
+sends its request and waits forever; what it sees is a timeout, or a "socket
+closed" it reads as a stuck add-on thread. The bridge now measures the gap
+between polls and treats one that no timer interval can produce -- with no tool
+code running in between, so a long render is not mistaken for a freeze -- as the
+process having been frozen. It closes the listening socket at that point (clients
+get connection-refused instead of hanging) and rebinds on the first normal tick,
+so the bridge comes back by itself on resume. The timer that drives it is no
+longer unregistered by a pause, which is what made the old code unable to come
+back at all.
+
+**No writable temp directory.** `/tmp` is not writable by an app uid on Android,
+and SELinux answers on policy rather than mode bits: a screenshot written to
+`/tmp` raises PermissionError however permissive the directory looks, with no
+graceful fallback. On Android the add-on now redirects `TMPDIR`/`TEMP`/`TMP` and
+`tempfile.tempdir` into the app's own data directory (`resource_path('LOCAL')`
++ `tmp`, write-tested before it is trusted). Tool code should write scratch files
+through `tempfile` or `bpy.utils.resource_path('LOCAL')`, never a literal
+`/tmp` path. Does nothing on any other platform, and never fails the add-on.
+
+**`bl_info` warning spam.** The add-on's metadata lives in its manifest, which
+only the extensions platform reads; sitting in the legacy `addons_core` folder
+it is scanned by `addon_utils`, which logs "add-on missing 'bl_info'" on every
+refresh. A literal `bl_info` dict is now declared, silencing it and naming the
+Preferences entry "MCP".
+
+**Client-side notes for whoever writes the tool code** (not add-on changes, but
+this is where they cost time):
+
+- A long operation must use the add-on's deferred convention: start the job with
+  `INVOKE_DEFAULT`, define `check_is_finished` returning `None` while it runs,
+  and the response is sent on a later timer tick. A synchronous
+  `EXEC_DEFAULT` export or render still blocks the frame loop -- the app no
+  longer trips Android's watchdog for it, but the UI does not update until the
+  operation finishes. The 1.6 s glTF export and the ~20 s shaded capture are
+  both cases of the same thing.
+- In Blender 5.3 it is `bpy.ops.export_scene.gltf(export_format='GLB', ...)`;
+  there is no `export_scene.glb`.
+- `MeshEdge.is_boundary` was removed: count boundary edges with
+  `bmesh` (`edge.link_faces`), not the RNA attribute.

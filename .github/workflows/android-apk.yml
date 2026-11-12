@@ -88,18 +88,36 @@ jobs:
 
       - name: Install host toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
-            curl wget xz-utils zip unzip yasm nasm \
-            autoconf automake libtool pkg-config flex bison texinfo \
-            openjdk-17-jdk-headless
+          # Every apt/PPA step is retried: the archive and Launchpad mirrors
+          # have both been observed to fail mid-read on the runners, and there
+          # is no reason to lose a 50-minute build to that.
+          for attempt in 1 2 3; do
+            sudo apt-get update && break
+            echo "[ci] apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          for attempt in 1 2 3; do
+            sudo apt-get install -y --no-install-recommends \
+              build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
+              curl wget xz-utils zip unzip yasm nasm \
+              autoconf automake libtool pkg-config flex bison texinfo \
+              openjdk-17-jdk-headless && break
+            echo "[ci] apt-get install toolchain failed (attempt $attempt), retrying"
+            sleep 15
+          done
           # Host code generators want GCC 14+ or Clang 17+ (env.sh picks the
           # first it finds, gcc-15 > gcc-14 > clang-18 > clang-17).
           if ! command -v gcc-14 && ! command -v gcc-15 && \
              ! command -v clang-17 && ! command -v clang-18; then
-            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-            sudo apt-get update
+            for attempt in 1 2 3; do
+              sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test && break
+              echo "[ci] add-apt-repository failed (attempt $attempt), retrying"
+              sleep 15
+            done
+            for attempt in 1 2 3; do
+              sudo apt-get update && break
+              sleep 15
+            done
             sudo apt-get install -y gcc-14 g++-14 || sudo apt-get install -y clang-17 || true
           fi
           (gcc-14 --version || gcc --version) | head -1
@@ -112,11 +130,27 @@ jobs:
           # support need the 3.13 the target profile ships (deps/build.sh also
           # stages its own host interpreter when it builds Python itself, but
           # the rest of the recipes expect one on the PATH).
+          # Retried: add-apt-repository talks to Launchpad over HTTPS and has
+          # been observed to die mid-read (IncompleteRead from launchpadlib),
+          # which fails a build that is otherwise healthy.
           if ! command -v python3.13; then
-            sudo add-apt-repository -y ppa:deadsnakes/ppa
-            sudo apt-get update
-            sudo apt-get install -y python3.13 python3.13-dev
+            for attempt in 1 2 3; do
+              sudo add-apt-repository -y ppa:deadsnakes/ppa && break
+              echo "[ci] add-apt-repository failed (attempt $attempt), retrying"
+              sleep 15
+            done
+            for attempt in 1 2 3; do
+              sudo apt-get update && break
+              echo "[ci] apt-get update failed (attempt $attempt), retrying"
+              sleep 15
+            done
+            for attempt in 1 2 3; do
+              sudo apt-get install -y python3.13 python3.13-dev && break
+              echo "[ci] apt-get install python3.13 failed (attempt $attempt), retrying"
+              sleep 15
+            done
           fi
+          command -v python3.13
           python3.13 --version
 
       - name: Fetch lib/linux_x64 (host libraries for the code generators)
@@ -198,16 +232,33 @@ jobs:
 
       - name: Install host toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
-            curl wget xz-utils zip unzip yasm nasm \
-            autoconf automake libtool pkg-config flex bison texinfo \
-            openjdk-17-jdk-headless
+          for attempt in 1 2 3; do
+            sudo apt-get update && break
+            echo "[ci] apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          for attempt in 1 2 3; do
+            sudo apt-get install -y --no-install-recommends \
+              build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
+              curl wget xz-utils zip unzip yasm nasm \
+              autoconf automake libtool pkg-config flex bison texinfo \
+              openjdk-17-jdk-headless && break
+            echo "[ci] apt-get install toolchain failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          # Host code generators want GCC 14+ or Clang 17+ (env.sh picks the
+          # first it finds, gcc-15 > gcc-14 > clang-18 > clang-17).
           if ! command -v gcc-14 && ! command -v gcc-15 && \
              ! command -v clang-17 && ! command -v clang-18; then
-            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-            sudo apt-get update
+            for attempt in 1 2 3; do
+              sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test && break
+              echo "[ci] add-apt-repository failed (attempt $attempt), retrying"
+              sleep 15
+            done
+            for attempt in 1 2 3; do
+              sudo apt-get update && break
+              sleep 15
+            done
             sudo apt-get install -y gcc-14 g++-14 || sudo apt-get install -y clang-17 || true
           fi
           (gcc-14 --version || gcc --version) | head -1

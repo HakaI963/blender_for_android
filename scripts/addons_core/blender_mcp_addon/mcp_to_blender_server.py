@@ -141,6 +141,30 @@ _DEFERRED_UNSUPPORTED_MESSAGE = (
     "background mode. Finish the request synchronously instead."
 )
 
+# ---------------------------------------------------------------------------
+# Frozen-process handling (Android).
+#
+# Android moves a backgrounded app into a cpuset with no CPU at all. Nothing
+# runs while it sits there -- this poll loop included -- yet the listening
+# socket stays open and the kernel keeps accepting connections into its
+# backlog. A client therefore connects fine, sends its request and waits for
+# an answer that can never come; the only symptom it ever sees is a timeout,
+# or a "socket closed" it reads as a stuck add-on thread.
+#
+# Detect the freeze from the clock. A gap between polls that no timer interval
+# in this add-on can produce, with no tool code having run in between, means
+# the process was frozen (or the device slept). Close the bridge for the
+# duration and rebind when the process runs again: a client that connects
+# while frozen gets a clean connection-refused on the next attempt instead of
+# hanging, and the bridge comes back by itself on resume.
+
+# Seconds of silence between polls that count as a freeze. The largest tick
+# this add-on can ask for is the idle interval (10s at its widest), so anything
+# beyond ~3x that cannot be a normal cadence.
+_FROZE_GAP_S = 30.0
+# How recently a tool must have finished for a long gap to be blamed on it.
+_FROZE_EXEC_GRACE_S = 1.0
+
 timer_internal_vars_calc()
 
 
@@ -206,6 +230,95 @@ class _State:
 
 
 _state = _State()
+
+# Where the bridge was last bound, so a freeze/rebind cycle does not need the
+# caller's preferences again.
+_last_bind_address: tuple[str, int] | None = None
+
+# True from a successful start() until an explicit stop(): a freeze closes the
+# socket for the duration but keeps this set, so the next normal tick rebinds.
+_want_running: bool = False
+
+# Timestamps for freeze detection, see the section above.
+_last_poll_time: float = 0.0
+_last_exec_time: float = 0.0
+_frozen: bool = False
+
+
+def should_keep_polling() -> bool:
+    """
+    Return whether the execution loop should keep being called.
+
+    Distinct from :func:`is_running`: this stays true while the bridge is
+    merely paused by a detected freeze, so the timer that drives it is not
+    unregistered and the bridge can rebind on resume.
+    """
+    return _want_running
+
+
+def _close_sockets() -> None:
+    """
+    Close the listening socket, every client and every queued response.
+
+    Leaves the "wanted" flag alone: callers decide whether this is a user stop
+    or a pause for a freeze.
+    """
+    sock = _state.sock
+    _state.sock = None
+    if sock is not None:
+        _close_conn(sock)
+
+    for client in _state.clients:
+        _close_conn(client.conn)
+    _state.clients.clear()
+
+    for pending in _state.pending_writes:
+        _close_conn(pending.conn)
+    _state.pending_writes.clear()
+
+    from . import deferred_tool
+    deferred_tool.close_all()
+
+
+def _freeze_check() -> None:
+    """
+    Close the bridge across a detected freeze and rebind after it.
+
+    Called at the top of every :func:`poll`, which is the earliest moment a
+    frozen process runs again.
+    """
+    global _last_poll_time, _last_exec_time, _frozen
+
+    now = time.monotonic()
+    gap = now - _last_poll_time
+    _last_poll_time = now
+
+    if not _want_running:
+        return
+
+    if gap > _FROZE_GAP_S and (now - _last_exec_time) > _FROZE_EXEC_GRACE_S:
+        # Nothing ran for `gap` seconds and no tool code was in flight when it
+        # started, so this was not a long operation: the process was frozen.
+        if not _frozen:
+            _frozen = True
+            if is_running():
+                print(
+                    "MCP: Blender was frozen for {:.1f}s (backgrounded); "
+                    "closing the bridge socket so clients fail fast".format(gap),
+                )
+                _close_sockets()
+        return
+
+    if _frozen:
+        _frozen = False
+        if not is_running() and _last_bind_address is not None:
+            host, port = _last_bind_address
+            try:
+                start(host, port)
+            except Exception as ex:  # pylint: disable=broad-exception-caught
+                print("MCP: failed to rebind after freeze: {:s}".format(str(ex)))
+                return
+            print("MCP: Blender is running again; bridge listening on {:s}:{:d}".format(host, port))
 
 
 class _ExecResult(NamedTuple):
@@ -545,6 +658,7 @@ def _service_clients() -> bool:
         else:
             _close_client_with_response(client, exec_result.response)
         did_work = True
+        _last_exec_time = time.monotonic()
 
     return did_work
 
@@ -556,6 +670,13 @@ def poll() -> bool:
 
     Return ``True`` if work was done, or deferred clients & queued responses are pending.
     """
+    global _last_poll_time
+
+    # A freeze can only be acted on once, on the first tick after it ends.
+    if _last_poll_time == 0.0:
+        _last_poll_time = time.monotonic()
+    _freeze_check()
+
     from . import deferred_tool
     # Stay in active polling mode until queued responses have been written.
     did_work = _flush_pending_writes()
@@ -675,28 +796,20 @@ def start(host: str, port: int) -> None:
         raise
 
     _state.sock = sock
+    # Remembered so a freeze/rebind cycle needs no preferences lookup, and so
+    # the operator's report can name the port that actually got bound.
+    global _want_running, _last_bind_address
+    _want_running = True
+    _last_bind_address = (host, port)
 
 
 def stop() -> None:
     """
     Close the listening socket, all client connections, queued responses and deferred responses.
     """
-    from . import deferred_tool
-
-    sock = _state.sock
-    _state.sock = None
-    if sock is not None:
-        _close_conn(sock)
-
-    for client in _state.clients:
-        _close_conn(client.conn)
-    _state.clients.clear()
-
-    for pending in _state.pending_writes:
-        _close_conn(pending.conn)
-    _state.pending_writes.clear()
-
-    deferred_tool.close_all()
+    global _want_running
+    _want_running = False
+    _close_sockets()
 
 
 def is_running() -> bool:

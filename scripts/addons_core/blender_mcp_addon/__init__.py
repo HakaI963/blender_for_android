@@ -11,6 +11,23 @@ __all__ = (
     "unregister",
 )
 
+# `bl_info` as a literal assignment at module level: this add-on ships its real
+# metadata in `blender_manifest.toml`, which only the extensions platform reads.
+# Sitting in the legacy `scripts/addons_core` folder it is scanned by
+# `addon_utils`, which logs "add-on missing 'bl_info'" for every module without
+# one -- on every add-on refresh, twice per add-on. Declaring it here keeps the
+# Preferences entry named "MCP" and the log quiet, and has no other effect.
+bl_info = {
+    "name": "MCP",
+    "author": "Blender Lab",
+    "version": (1, 0, 3),
+    "blender": (5, 1, 0),
+    "location": "Preferences > Add-ons",
+    "description": "MCP server add-on for LLM interaction",
+    "category": "Development",
+    "doc_url": "https://www.blender.org/lab/mcp-server/",
+}
+
 import bpy  # pylint: disable=import-error
 import sys
 from bpy.props import (
@@ -135,6 +152,23 @@ class _BlenderMCPPreferences(bpy.types.AddonPreferences):  # type: ignore[misc]
         subtype="TIME_ABSOLUTE",
     )
 
+    use_port_fallback: BoolProperty(  # type: ignore[valid-type]
+        name="Port Fallback",
+        description=(
+            "When the preferred port is already taken (another bridge add-on holds it),\n"
+            "listen on the next free port above it and log which one was taken\n"
+            "instead of giving up silently"
+        ),
+        default=True,
+    )
+    port_fallback_range: IntProperty(  # type: ignore[valid-type]
+        name="Fallback Range",
+        description="How many ports above the preferred one to try",
+        default=64,
+        min=1,
+        max=1000,
+    )
+
     def _update_use_log(self, _context: bpy.types.Context) -> None:
         mcp_to_blender_server.use_log = self.use_log
 
@@ -203,6 +237,8 @@ class _BlenderMCPPreferences(bpy.types.AddonPreferences):  # type: ignore[misc]
         layout.prop(self, "port")
         layout.prop(self, "use_autostart")
         layout.prop(self, "autostart_delay")
+        layout.prop(self, "use_port_fallback")
+        layout.prop(self, "port_fallback_range")
         layout.prop(self, "timer_interval_active")
         layout.prop(self, "timer_interval_idle")
         layout.prop(self, "timer_interval_idle_delay")
@@ -244,17 +280,20 @@ class _BLMCP_OT_server_start(bpy.types.Operator):  # type: ignore[misc]
             idle_delay=prefs.timer_interval_idle_delay,
         )
         mcp_to_blender_server.use_log = prefs.use_log
-        try:
-            mcp_to_blender_server.start(prefs.host, prefs.port)
-        except Exception as ex:  # pylint: disable=broad-exception-caught
-            _State.startup_info_set_from_exception(ex)
-            self.report({"ERROR"}, str(ex))
+        bound_port = _start_with_port_fallback(prefs)
+        if bound_port is None:
+            _State.startup_info_set("Could not start the MCP bridge server, see the console")
+            self.report({"ERROR"}, "Could not start the MCP bridge server, see the console")
             return {"CANCELLED"}
+        _State.startup_info_clear()
         bpy.app.timers.register(
             execute_interactive.run,
             first_interval=mcp_to_blender_server.TIMER_INTERVAL_ACTIVE,
             persistent=True)
-        self.report({"INFO"}, "MCP server started on {:s}:{:d}".format(prefs.host, prefs.port))
+        self.report(
+            {"INFO"},
+            "MCP server started on {:s}:{:d}".format(prefs.host, bound_port),
+        )
         return {"FINISHED"}
 
 
@@ -274,6 +313,49 @@ class _BLMCP_OT_server_stop(bpy.types.Operator):  # type: ignore[misc]
             bpy.app.timers.unregister(execute_interactive.run)
         self.report({"INFO"}, "MCP bridge server stopped")
         return {"FINISHED"}
+
+
+def _start_with_port_fallback(prefs) -> int | None:
+    """
+    Start the bridge on the preferred port, falling back above it if taken.
+
+    Returns the port actually bound, or ``None`` when no port could be bound.
+    The conflict case (a second bridge add-on already holding the port) is
+    logged loudly rather than silently skipped: an auto-start that does nothing
+    leaves no trace anywhere, which is indistinguishable from a working server
+    until a client times out.
+    """
+    host = prefs.host
+    port = prefs.port
+    try:
+        mcp_to_blender_server.start(host, port)
+        return port
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        first_error = ex
+
+    if not prefs.use_port_fallback:
+        print(
+            "[blender-android] MCP: could not start the bridge server: {:s}".format(str(first_error)),
+        )
+        return None
+
+    for offset in range(1, prefs.port_fallback_range + 1):
+        try_port = prefs.port + offset
+        try:
+            mcp_to_blender_server.start(host, try_port)
+            print(
+                "[blender-android] MCP: port {:d} is already in use, listening on {:d} instead".format(
+                    prefs.port, try_port,
+                ),
+            )
+            return try_port
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+
+    # Nothing in the range worked: report the original failure, which is the
+    # one that explains the situation (in use, permission denied, ...).
+    print("[blender-android] MCP: could not start the bridge server: {:s}".format(str(first_error)))
+    return None
 
 
 def _autostart_timer() -> None:
@@ -301,11 +383,11 @@ def _autostart_timer() -> None:
     if mcp_to_blender_server.is_running():
         return
 
-    try:
-        mcp_to_blender_server.start(prefs.host, prefs.port)
-    except Exception as ex:  # pylint: disable=broad-exception-caught
-        _State.startup_info_set_from_exception(ex)
+    bound_port = _start_with_port_fallback(prefs)
+    if bound_port is None:
+        _State.startup_info_set("Could not start the MCP bridge server, see the console")
         return
+    _State.startup_info_clear()
 
     bpy.app.timers.register(
         execute_interactive.run,
@@ -330,10 +412,52 @@ _classes = (
 )
 
 
+def _setup_android_temp_dir() -> None:
+    """
+    Point Python's temp directory somewhere the app uid can write.
+
+    Android gives every app its own uid, and SELinux then denies it write access
+    to /tmp: a tool writing a screenshot to /tmp (or anything built from
+    ``tempfile``'s default) fails with PermissionError no matter what the mode
+    bits say, because the kernel is answering on policy, not permissions. The
+    app's own data directory is writable (Blender's user config already lives
+    there), so redirect TMPDIR/TEMP/TMP at it and seed ``tempfile.tempdir``.
+    ``bpy.utils.resource_path('LOCAL')`` is that directory on this port.
+
+    Does nothing on desktop, and does nothing if anything here fails: this is a
+    convenience for tool code, never a reason for the add-on not to start.
+    """
+    if not _is_android:
+        return
+    try:
+        import os
+        import tempfile
+
+        base = bpy.utils.resource_path("LOCAL")
+        if not base:
+            return
+        tmpdir = os.path.join(str(base), "tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        # A write test, because a directory that cannot be created does not mean
+        # one that cannot be written to.
+        with open(os.path.join(tmpdir, ".write_test"), "w"):
+            pass
+        os.remove(os.path.join(tmpdir, ".write_test"))
+        os.environ["TMPDIR"] = tmpdir
+        os.environ["TEMP"] = tmpdir
+        os.environ["TMP"] = tmpdir
+        tempfile.tempdir = tmpdir
+        print("[blender-android] MCP: temp directory is {:s}".format(tmpdir))
+    except Exception as ex:  # pylint: disable=broad-exception-caught
+        print("[blender-android] MCP: could not set up a temp directory: {:s}".format(str(ex)))
+
+
 def register() -> None:
     for cls in _classes:
         bpy.utils.register_class(cls)
     _cli_commands.append(bpy.utils.register_cli_command("blender_mcp", _cli_execute_handler))
+
+    _setup_android_temp_dir()
 
     # Defer auto-start so the server does not slow down Blender's startup.
     if not bpy.app.background:

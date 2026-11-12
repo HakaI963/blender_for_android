@@ -39,7 +39,10 @@ def run() -> float | None:
         # This is undefined, set to true so we reset the timer.
         did_work = True
 
-    if not mcp_to_blender_server.is_running():
+    # A freeze (Android background cpuset) closes the socket for its duration
+    # but leaves the add-on wanting to serve, so the timer stays registered and
+    # the bridge rebinds on its own; only an explicit stop unregisters it.
+    if not mcp_to_blender_server.should_keep_polling():
         return None
 
     if did_work:
