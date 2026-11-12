@@ -1,6 +1,6 @@
 # MCP bridge + export-freeze fix + CI APK builds
 
-Three related changes to this fork, all requested together:
+Four related changes to this fork, all requested together:
 
 1. The Blender Lab **MCP bridge add-on** (v1.0.3) is bundled in the APK, enabled
    by default, and its network permission is permanently available.
@@ -9,6 +9,7 @@ Three related changes to this fork, all requested together:
    thread.
 3. The APK is built by **GitHub Actions** ([.github/workflows/android-apk.yml](.github/workflows/android-apk.yml)),
    so no local gradle/NDK run is needed to produce an APK.
+4. The app runs **landscape** and **stays open in the background**.
 
 ## 1. The MCP add-on, always active
 
@@ -100,3 +101,41 @@ process (it calls `exit()`), now from the frame thread.
 Triggered by a push to `main` or manually from the Actions tab (`full` or `lite`).
 Each job is capped at 350 minutes; if a run is cut short, the deps cache of that
 run is simply not written and the next run starts clean.
+
+## 4. Landscape, and staying open in the background
+
+Two separate causes, both in the activity, not in Blender.
+
+**Portrait.** The manifest declared `android:screenOrientation="user"`, so the
+device's own rotation setting decided the orientation, and on a phone held
+upright that is portrait. `setRequestedOrientation(LANDSCAPE)` in
+`BlenderActivity.onCreate` loses either way: it runs after the native side has
+seen a portrait window, and a manifest `user` leaves the app's own request
+subordinate to the device setting. Fixed in the manifest
+(`sensorLandscape`, applied before any surface exists, so the window is created
+landscape from the first frame), with the Java call matched to it. Landscape in
+either direction; a rotation lock is still respected, and it can never come out
+in portrait.
+
+**Background.** An activity that is recreated is not a display hiccup here: it
+runs `ANativeActivity_onCreate` again, which is a second `android_main` and a
+second Blender init inside the one process — the app visibly restarts, and that
+is what "does not stay open" is. Two halves:
+
+- The manifest's `configChanges` now also lists the settings that change while an
+  app sits in the background (locale, layout direction, font scale, color mode,
+  font weight, grammatical gender, smallest screen size). A change in any of
+  them used to recreate the activity, and with it the app.
+- The frame loop itself idles while there is no surface. Backgrounding destroys
+  the surface (TERM_WINDOW), and without this the loop pinned a core on the
+  largest process on the device — a background app at 100% CPU is first in line
+  for the low-memory killer. It now sleeps 8 ms per iteration instead: timers
+  (the MCP bridge's poll among them) keep running, so a backgrounded Blender
+  still answers its client, but the process is quiet. `hasValidWindow()` on
+  GHOST_SystemAndroid is the signal, and the Vulkan side already expected this
+  (`recreateSwapchain` returns early with no surface: "Android window
+  backgrounded").
+
+Also fixed on the way: a reborn surface that arrives before the window exists is
+no longer dropped (the pending command retries) — that race is what left a black
+window after a quick app-switch during startup.

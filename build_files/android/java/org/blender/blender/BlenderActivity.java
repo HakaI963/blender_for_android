@@ -32,7 +32,11 @@ public class BlenderActivity extends NativeActivity {
   @Override
   protected void onCreate(Bundle state) {
     super.onCreate(state);
-    setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+    /* Must agree with the manifest's android:screenOrientation="sensorLandscape":
+     * the manifest value is what the system applies before the surface exists,
+     * and this call only reinforces it afterwards (an earlier mismatch left the
+     * app opening in portrait on a phone held upright). */
+    setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
 
     inputView = new InputView(this);
     addContentView(inputView, new ViewGroup.LayoutParams(1, 1));

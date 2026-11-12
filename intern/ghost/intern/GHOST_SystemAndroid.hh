@@ -96,6 +96,19 @@ class GHOST_SystemAndroid : public GHOST_System {
   void checkInputTimers();
 
   /**
+   * True when the window has a surface to draw into.
+   *
+   * False while the app is in the background (Android destroys the surface and
+   * sends TERM_WINDOW), which is the signal the frame loop uses to idle instead
+   * of spinning: nothing can be presented, and burning a core on the largest
+   * process on the device is what gets it killed out from under the user.
+   */
+  bool hasValidWindow() const
+  {
+    return window_ && window_->getValid();
+  }
+
+  /**
    * Carry out the surface/focus command the glue deferred for this thread.
    *
    * The Android activity thread owns the looper and hands surface create /

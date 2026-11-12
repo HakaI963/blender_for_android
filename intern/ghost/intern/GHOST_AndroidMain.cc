@@ -220,7 +220,18 @@ static void *ghost_android_frame_thread(void *arg)
     /* Surface create/resize/destroy and focus changes wait here until they can
      * run between frames -- see processPendingWindowCommand(). */
     system->processPendingWindowCommand();
+
     blender::WM_main_loop_body(context);
+
+    /* No surface means the app is in the background: nothing can be presented,
+     * and this loop would otherwise pin a core on the largest process on the
+     * device. That is exactly what gets a background app killed, which is what
+     * "Blender did not stay open" looks like from the outside. Timers keep
+     * running -- the MCP bridge's poll among them -- just at a calmer pace, so
+     * a backgrounded Blender still answers its client. */
+    if (!system->hasValidWindow()) {
+      usleep(8 * 1000);
+    }
   }
   return nullptr;
 }

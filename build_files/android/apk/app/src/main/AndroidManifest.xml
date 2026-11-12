@@ -34,24 +34,33 @@
         <!-- BlenderActivity extends NativeActivity; loads libblender.so and
              bridges soft-keyboard IME text to native.
 
-             screenOrientation="user" follows the device's own rotation setting,
-             so the app turns when the user lets it and stays put when they have
-             rotation locked. orientation and screenSize are in configChanges,
-             which keeps the activity from being recreated on every turn: the
-             surface is resized under it instead, and GHOST rebuilds the Vulkan
-             swapchain from APP_CMD_WINDOW_RESIZED.
+             screenOrientation is pinned in the manifest rather than requested
+             from Java: the manifest value is applied before any surface
+             exists, so the window is created in landscape from the first
+             frame. With `user` (what this was), the device's own rotation
+             setting won and the app opened portrait on a phone held upright;
+             setRequestedOrientation() from onCreate either lost that race
+             against the already-created window or was ignored, and the app
+             stayed portrait. `sensorLandscape` keeps the app landscape in
+             either landscape direction, and still respects a rotation lock
+             (it cannot come out in portrait).
 
-             launchMode="singleTask" is not cosmetic: this is a NativeActivity, and a
-             second instance in the same process would run ANativeActivity_onCreate
-             again, starting a second android_main and a second Blender init on top of
-             the first. It makes a tapped .blend arrive at onNewIntent in the running
-             instance instead. -->
+             configChanges lists everything that must not recreate the
+             activity. Recreation is not a display hiccup here: it runs
+             ANativeActivity_onCreate again -- a second android_main, a second
+             Blender init inside the same process, i.e. the app visibly
+             restarts and does not "stay open in the background". The
+             display/theme/font entries beyond the usual four are the system
+             settings that change while an app sits in the background (dark
+             mode, font size, locale, layout direction) and would otherwise
+             restart it on return.
+             -->
         <activity
             android:name="org.blender.blender.BlenderActivity"
             android:label="Blender"
             android:launchMode="singleTask"
-            android:screenOrientation="user"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|density|navigation|uiMode"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|density|navigation|uiMode|locale|layoutDirection|fontScale|colorMode|fontWeightAdjustment|grammaticalGender"
             android:exported="true">
             <meta-data android:name="android.app.lib_name" android:value="blender" />
             <intent-filter>

@@ -298,6 +298,11 @@ void GHOST_SystemAndroid::processPendingWindowCommand()
   switch (command) {
     case PendingWindowCommand::Init: {
       if (!window_ || !app->window) {
+        /* The surface is not there (yet) -- it can arrive while Blender init is
+         * still creating the window, or before the activity has handed one over.
+         * Leave the command pending so a later frame retries it instead of
+         * dropping a reborn surface, which would leave a black window. */
+        pending_window_command_.store(PendingWindowCommand::Init);
         return;
       }
       window_->setNativeWindow(app->window);
@@ -310,6 +315,7 @@ void GHOST_SystemAndroid::processPendingWindowCommand()
     }
     case PendingWindowCommand::Resize: {
       if (!window_ || !app->window) {
+        pending_window_command_.store(PendingWindowCommand::Resize);
         return;
       }
       window_->setNativeWindow(app->window);
