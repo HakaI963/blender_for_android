@@ -15,6 +15,12 @@
 # Triggers: a push to main, or Run workflow from the Actions tab (config: full
 # or lite). The artifact is the same debug-signed development APK the local
 # build produces -- installable as-is.
+#
+# The runner images ship their own Android SDK/NDK and export ANDROID_HOME,
+# ANDROID_NDK_ROOT and ANDROID_NDK_VERSION pointing at it. env.sh reads those
+# first, so without the overrides below the build would silently cross-compile
+# against the image's NDK 27 instead of the pinned 28.2 (or against a deleted
+# directory, since this workflow frees disk by removing the image's SDK).
 
 name: Android APK
 
@@ -39,10 +45,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Shared by both jobs: build.py resolves BUILD_BASE from the environment when
-  # set, and the cache path has to agree with it.
+  # Shared by both jobs: build.py and deps/build.sh resolve BUILD_BASE from the
+  # environment, and the cache path has to agree with it.
   BUILD_BASE: /home/runner/work/blender_build_android
   CONFIG: ${{ inputs.config || 'full' }}
+  # Own the Android toolchain locations, so the image's exported Android
+  # variables cannot redirect the build.
+  ANDROID_HOME: /home/runner/android-sdk
+  ANDROID_NDK_VERSION: 28.2.13676358
+  ANDROID_NDK_ROOT: /home/runner/android-sdk/ndk/28.2.13676358
+  JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
 
 jobs:
   deps:
@@ -57,7 +69,9 @@ jobs:
 
       - name: Free disk space
         run: |
-          # The images ship large SDK/runtime dirs this build never uses.
+          # The images ship large SDK/runtime dirs this build never uses. The
+          # image's own Android SDK goes too: this workflow installs the pinned
+          # NDK under $ANDROID_HOME (see the overrides above) instead.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
           df -h /
@@ -68,7 +82,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
             curl wget xz-utils zip unzip yasm nasm \
-            autoconf automake libtool pkg-config flex bison texinfo
+            autoconf automake libtool pkg-config flex bison texinfo \
+            openjdk-17-jdk-headless
           # Host code generators want GCC 14+ or Clang 17+ (env.sh picks the
           # first it finds, gcc-15 > gcc-14 > clang-18 > clang-17).
           if ! command -v gcc-14 && ! command -v gcc-15 && \
@@ -84,8 +99,9 @@ jobs:
       - name: Install host Python 3.13
         run: |
           # Ubuntu 24.04 ships 3.12; the numpy cross-build and USD's Python
-          # support need the 3.13 the target profile ships (deps/build.sh's
-          # host_python() finds it through `command -v python3.13`).
+          # support need the 3.13 the target profile ships (deps/build.sh also
+          # stages its own host interpreter when it builds Python itself, but
+          # the rest of the recipes expect one on the PATH).
           if ! command -v python3.13; then
             sudo add-apt-repository -y ppa:deadsnakes/ppa
             sudo apt-get update
@@ -105,6 +121,21 @@ jobs:
             https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
           git -C lib/linux_x64 lfs pull || echo "[ci] no LFS objects in lib/linux_x64 (fine)"
           du -sh lib/linux_x64
+
+      - name: Install the Android SDK and NDK
+        run: |
+          set -eux
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.1" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          ls "$ANDROID_HOME/ndk"
 
       - name: Cross-compile dependencies
         run: |
@@ -156,7 +187,7 @@ jobs:
           fi
           (gcc-14 --version || gcc --version) | head -1
           # env.sh's default JAVA_HOME on Linux; verify it is where apt put it.
-          ls -d /usr/lib/jvm/java-17-openjdk-amd64
+          ls -d "$JAVA_HOME"
 
       - name: Install host Python 3.13
         run: |
@@ -202,18 +233,17 @@ jobs:
       - name: Install the Android SDK and NDK
         run: |
           set -eux
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
           curl -fsSL -o /tmp/cmdline-tools.zip \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q /tmp/cmdline-tools.zip -d "$HOME/android-sdk/cmdline-tools"
-          rm -rf "$HOME/android-sdk/cmdline-tools/latest"
-          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
-          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android-sdk" --licenses >/dev/null || true
-          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android-sdk" \
+          unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
             "platform-tools" "platforms;android-35" "build-tools;35.0.1" \
-            "ndk;28.2.13676358"
-          ls "$HOME/android-sdk/ndk"
+            "ndk;${ANDROID_NDK_VERSION}"
+          ls "$ANDROID_HOME/ndk"
 
       - name: Build Blender and package the APK
         run: |
