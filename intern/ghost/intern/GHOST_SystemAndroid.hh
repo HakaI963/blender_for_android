@@ -12,6 +12,7 @@
 #include "GHOST_Buttons.hh"
 #include "GHOST_System.hh"
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -83,6 +84,29 @@ class GHOST_SystemAndroid : public GHOST_System {
    * `WM_OT_open_mainfile` -- the same path a file double-clicked in the Finder takes. */
   void handleOpenMainFile(const char *path);
 
+  /**
+   * Run the timed input checks (long-press, hover-exit park).
+   *
+   * Called by the Android main thread once per loiter iteration, where the
+   * touch state they read is written. They used to run inside processEvents()
+   * on the frame-loop thread, which worked while one thread did everything;
+   * with the frame loop on its own thread that would split the touch state
+   * across two threads for no gain.
+   */
+  void checkInputTimers();
+
+  /**
+   * Carry out the surface/focus command the glue deferred for this thread.
+   *
+   * The Android activity thread owns the looper and hands surface create /
+   * resize / destroy and focus changes to whoever runs the frame loop.
+   * Rebuilding the Vulkan surface (setNativeWindow) must not race the frame
+   * being drawn, so the glue records *what* happened in an atomic flag and
+   * the frame loop performs it at the top of an iteration -- the same point
+   * in the frame where, single-threaded, the glue used to run it inline.
+   */
+  void processPendingWindowCommand();
+
  private:
   GHOST_TSuccess init() override;
 
@@ -104,9 +128,32 @@ class GHOST_SystemAndroid : public GHOST_System {
   GHOST_WindowAndroid *window_;
   uint64_t start_time_;
 
-  /* Input state tracked from events for the out-of-queue queries. */
+  /* Surface and focus commands deferred by the activity thread, executed by
+   * the frame loop in processPendingWindowCommand(). */
+  enum class PendingWindowCommand {
+    /** Nothing to do. */
+    None,
+    /** The surface came back (first window, or rebirth after backgrounding). */
+    Init,
+    /** Rotation or a window resize kept the same surface. */
+    Resize,
+    /** The surface went away (app backgrounded). */
+    Term,
+  };
+  std::atomic<PendingWindowCommand> pending_window_command_{PendingWindowCommand::None};
+  /** Focus change deferred the same way: 0 lost, 1 gained, -1 none pending. */
+  std::atomic<int> pending_focus_{-1};
+
+  /* Input state tracked from events for the out-of-queue queries. Written from
+   * the activity thread (the input handlers and the timed checks run there);
+   * meta_state_ is read by the window manager on the frame-loop thread through
+   * getModifierKeys(), so it is atomic. buttons_ is read the same way through
+   * getButtons(); it is a single aligned word copy, so the worst a missed
+   * update can do is report the previous frame's button state. Everything else
+   * in this block is only ever read back on the activity thread itself
+   * (checkInputTimers() and the input handlers). */
   GHOST_Buttons buttons_;
-  int32_t meta_state_;
+  std::atomic<int32_t> meta_state_;
   int32_t cursor_x_, cursor_y_;
 
   /* S Pen side button, tracked so it works while hovering or touching. */

@@ -121,13 +121,15 @@ bool GHOST_SystemAndroid::processEvents(bool /*waitForEvent*/)
   /* Soft-keyboard input arrives on the Android UI thread; dispatch it here. */
   drainJavaInput();
 
-  /* A finger held still emits no events, so the long-press is timed here. */
-  touchLongPressCheck();
-  hoverExitCheck();
+  /* The timed touch checks (long-press, hover-exit park) used to run here. With
+   * the frame loop on its own thread they belong on the activity thread instead,
+   * where the touch state they read is written: see checkInputTimers(), called
+   * from GHOST_AndroidMain.cc's loiter loop. */
 
   /* Input arrives asynchronously via the glue calling handleInputEvent(), which
-   * queues GHOST events. Report whether any are pending so the window manager
-   * actually dispatches them (it only calls dispatchEvents() when this is true). */
+   * queues GHOST events on the (mutex-protected) stack. Report whether any are
+   * pending so the window manager actually dispatches them (it only calls
+   * dispatchEvents() when this is true). */
   return getEventManager()->getNumEvents() != 0;
 }
 
@@ -222,23 +224,14 @@ void GHOST_SystemAndroid::handleNativeWindowInit(android_app *app)
                       "INIT_WINDOW window=%p ghost_window=%p",
                       (void *)app->window,
                       (void *)window_);
-  if (window_ && app->window) {
-    window_->setNativeWindow(app->window);
-    pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowSize, window_));
-    /* The window dimensions are unchanged across a background/foreground cycle, so
-     * a size event alone schedules no redraw. Force an update so the reborn surface
-     * is actually painted (else the window stays black after app switch). */
-    pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowUpdate, window_));
-    /* The focus command can arrive before Blender exists, so claim it here as well. */
-    handleWindowFocus(true);
-  }
+  /* The work itself (setNativeWindow, the size/update events, claiming focus)
+   * runs in processPendingWindowCommand() on the frame-loop thread, where it
+   * cannot race the frame being drawn. */
+  pending_window_command_.store(PendingWindowCommand::Init);
 }
 
 void GHOST_SystemAndroid::handleWindowFocus(bool gained)
 {
-  if (!window_) {
-    return;
-  }
   /* Without this the window manager never learns the window is active, and it then treats every
    * button event as arriving at a window that is being entered: it takes the cursor position from
    * GHOST at that moment and writes it over the position the event carries.
@@ -248,11 +241,12 @@ void GHOST_SystemAndroid::handleWindowFocus(bool gained)
    * slop and is then reported where the finger landed, deliberately, because that is what decides
    * which widget was pressed -- and this overwrote exactly that, handing the press the position
    * the finger had already reached. Dragging an editor border was impossible as a result: by the
-   * time the press existed it was tens of pixels away from the border it was aimed at. */
-  pushEvent(std::make_unique<GHOST_Event>(
-      getMilliSeconds(),
-      gained ? GHOST_kEventWindowActivate : GHOST_kEventWindowDeactivate,
-      window_));
+   * time the press existed it was tens of pixels away from the border it was aimed at.
+   *
+   * Deferred to the frame loop like the surface commands: the event it pushes belongs in the
+   * queue in front of the next frame, and the window it refers to may only just have been
+   * created there. */
+  pending_focus_.store(gained ? 1 : 0);
 }
 
 void GHOST_SystemAndroid::handleNativeWindowResize()
@@ -264,12 +258,10 @@ void GHOST_SystemAndroid::handleNativeWindowResize()
    * through setNativeWindow() is what rebuilds the Vulkan surface and swapchain
    * for the new geometry; presenting to the old one gives a stretched or
    * black frame. getClientBounds() reads the size from the native window each
-   * time it is asked, so nothing else has to be told the new numbers. */
-  window_->setNativeWindow(app_->window);
-  pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowSize, window_));
-  /* A size event on its own only relayouts; force the repaint too, the same way
-   * the surface-reborn path does. */
-  pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowUpdate, window_));
+   * time it is asked, so nothing else has to be told the new numbers.
+   *
+   * The rebuild happens on the frame-loop thread, see processPendingWindowCommand(). */
+  pending_window_command_.store(PendingWindowCommand::Resize);
 }
 
 void GHOST_SystemAndroid::handleNativeWindowTerm()
@@ -277,8 +269,75 @@ void GHOST_SystemAndroid::handleNativeWindowTerm()
   __android_log_print(
       ANDROID_LOG_INFO, "blender-surface", "TERM_WINDOW ghost_window=%p", (void *)window_);
   if (window_) {
-    window_->setNativeWindow(nullptr);
+    pending_window_command_.store(PendingWindowCommand::Term);
   }
+}
+
+void GHOST_SystemAndroid::processPendingWindowCommand()
+{
+  android_app *app = app_;
+  if (app == nullptr) {
+    return;
+  }
+
+  /* Take the command first: a newer one that arrives while this runs is picked
+   * up by the next frame rather than lost. */
+  const PendingWindowCommand command = pending_window_command_.exchange(PendingWindowCommand::None);
+  const int focus = pending_focus_.exchange(-1);
+
+  if (focus >= 0) {
+    /* The focus command can arrive before Blender exists, so claim it here as well. */
+    if (window_) {
+      pushEvent(std::make_unique<GHOST_Event>(
+          getMilliSeconds(),
+          focus ? GHOST_kEventWindowActivate : GHOST_kEventWindowDeactivate,
+          window_));
+    }
+  }
+
+  switch (command) {
+    case PendingWindowCommand::Init: {
+      if (!window_ || !app->window) {
+        return;
+      }
+      window_->setNativeWindow(app->window);
+      pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowSize, window_));
+      /* The window dimensions are unchanged across a background/foreground cycle, so
+       * a size event alone schedules no redraw. Force an update so the reborn surface
+       * is actually painted (else the window stays black after app switch). */
+      pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowUpdate, window_));
+      break;
+    }
+    case PendingWindowCommand::Resize: {
+      if (!window_ || !app->window) {
+        return;
+      }
+      window_->setNativeWindow(app->window);
+      pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowSize, window_));
+      /* A size event on its own only relayouts; force the repaint too, the same way
+       * the surface-reborn path does. */
+      pushEvent(std::make_unique<GHOST_Event>(getMilliSeconds(), GHOST_kEventWindowUpdate, window_));
+      break;
+    }
+    case PendingWindowCommand::Term: {
+      if (window_) {
+        window_->setNativeWindow(nullptr);
+      }
+      break;
+    }
+    case PendingWindowCommand::None:
+    default:
+      break;
+  }
+}
+
+void GHOST_SystemAndroid::checkInputTimers()
+{
+  /* Both only run on the activity thread, where the touch state they read is
+   * written, and neither may run while a frame is drawn: they push synthetic
+   * cursor/button events that must land in the queue in event order. */
+  touchLongPressCheck();
+  hoverExitCheck();
 }
 
 static GHOST_TabletData tablet_from_event(AInputEvent *event)
@@ -332,7 +391,7 @@ int32_t GHOST_SystemAndroid::handleMotionEvent(AInputEvent *event)
     const int32_t y = int32_t(ghost_android_scale_input(AMotionEvent_getY(event, 0)));
     cursor_x_ = x;
     cursor_y_ = y;
-    meta_state_ = AMotionEvent_getMetaState(event);
+    meta_state_.store(AMotionEvent_getMetaState(event));
     pushEvent(std::make_unique<GHOST_EventCursor>(
         getMilliSeconds(), GHOST_kEventCursorMove, window_, x, y, GHOST_TABLET_DATA_NONE));
 
@@ -529,7 +588,7 @@ int32_t GHOST_SystemAndroid::handleMotionEvent(AInputEvent *event)
                                               tablet_from_event(event);
   int32_t x = int32_t(ghost_android_scale_input(AMotionEvent_getX(event, 0)));
   int32_t y = int32_t(ghost_android_scale_input(AMotionEvent_getY(event, 0)));
-  meta_state_ = AMotionEvent_getMetaState(event);
+  meta_state_.store(AMotionEvent_getMetaState(event));
 
   /* A pointer that leaves proximity simply stops sending events, so reporting its last
    * position keeps the button under it highlighted and its tooltip on screen forever.
@@ -643,10 +702,10 @@ void GHOST_SystemAndroid::touchSendShift(bool down)
    * and injects a matching press or release whenever it disagrees with the event state, so the
    * synthetic key event only survives if meta_state_ tells the same story. */
   if (down) {
-    meta_state_ |= AMETA_SHIFT_ON;
+    meta_state_.fetch_or(AMETA_SHIFT_ON);
   }
   else {
-    meta_state_ &= ~AMETA_SHIFT_ON;
+    meta_state_.fetch_and(~AMETA_SHIFT_ON);
   }
   pushEvent(std::make_unique<GHOST_EventKey>(getMilliSeconds(),
                                              down ? GHOST_kEventKeyDown : GHOST_kEventKeyUp,
@@ -662,14 +721,14 @@ void GHOST_SystemAndroid::touchSendFullArea()
    * has just put at the fingers. Ctrl is mirrored into meta_state_ for the reason touchSendShift
    * gives. */
   const uint64_t time = getMilliSeconds();
-  meta_state_ |= AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON;
+  meta_state_.fetch_or(AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON);
   pushEvent(std::make_unique<GHOST_EventKey>(
       time, GHOST_kEventKeyDown, window_, GHOST_kKeyLeftControl, false));
   pushEvent(
       std::make_unique<GHOST_EventKey>(time, GHOST_kEventKeyDown, window_, GHOST_kKeySpace, false));
   pushEvent(
       std::make_unique<GHOST_EventKey>(time, GHOST_kEventKeyUp, window_, GHOST_kKeySpace, false));
-  meta_state_ &= ~(AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON);
+  meta_state_.fetch_and(~(AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON));
   pushEvent(std::make_unique<GHOST_EventKey>(
       time, GHOST_kEventKeyUp, window_, GHOST_kKeyLeftControl, false));
 }
@@ -883,7 +942,7 @@ int32_t GHOST_SystemAndroid::handleKeyEvent(AInputEvent *event)
    * BlenderActivity.dispatchKeyEvent(), which forwards it with the character resolved by
    * KeyCharacterMap (see handleJavaKeyEvent). Having every key take that one route also keeps
    * them in order. */
-  meta_state_ = AKeyEvent_getMetaState(event);
+  meta_state_.store(AKeyEvent_getMetaState(event));
   return 0;
 }
 
@@ -1005,7 +1064,7 @@ void GHOST_SystemAndroid::dispatchJavaKeyEvent(
   if (!window_) {
     return;
   }
-  meta_state_ = meta_state;
+  meta_state_.store(meta_state);
   const GHOST_TKey key = convertAndroidKey(keycode);
   if (key == GHOST_kKeyUnknown) {
     return;
@@ -1025,10 +1084,11 @@ void GHOST_SystemAndroid::dispatchJavaKeyEvent(
 
 GHOST_TSuccess GHOST_SystemAndroid::getModifierKeys(GHOST_ModifierKeys &keys) const
 {
-  const bool shift = (meta_state_ & AMETA_SHIFT_ON) != 0;
-  const bool ctrl = (meta_state_ & AMETA_CTRL_ON) != 0;
-  const bool alt = (meta_state_ & AMETA_ALT_ON) != 0;
-  const bool os = (meta_state_ & AMETA_META_ON) != 0;
+  const int32_t meta_state = meta_state_.load();
+  const bool shift = (meta_state & AMETA_SHIFT_ON) != 0;
+  const bool ctrl = (meta_state & AMETA_CTRL_ON) != 0;
+  const bool alt = (meta_state & AMETA_ALT_ON) != 0;
+  const bool os = (meta_state & AMETA_META_ON) != 0;
   keys.set(GHOST_kModifierKeyLeftShift, shift);
   keys.set(GHOST_kModifierKeyRightShift, shift);
   keys.set(GHOST_kModifierKeyLeftControl, ctrl);

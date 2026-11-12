@@ -1,0 +1,222 @@
+# SPDX-FileCopyrightText: 2026 Blender Authors
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Build the Android APK on GitHub's runners: no local gradle, no local NDK, no
+# local 60 GB build tree on the machine that asks for the APK.
+#
+# Two jobs. `deps` cross-compiles the ~56 third-party libraries (hours) and
+# caches the prefix; `apk` restores it, builds the host code generators and
+# libblender.so, packages the payload and uploads the signed APK as an artifact.
+# Splitting them keeps the hours of dependency work reusable: a rerun of `apk`
+# alone starts from the cached prefix instead of paying for both halves again,
+# and each half stays inside the 6-hour job limit.
+#
+# Triggers: a push to main, or Run workflow from the Actions tab (config: full
+# or lite). The artifact is the same debug-signed development APK the local
+# build produces -- installable as-is.
+
+name: Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Build configuration"
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - lite
+  push:
+    branches:
+      - main
+
+concurrency:
+  # A newer push supersedes the running build; the queued one starts fresh.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Shared by both jobs: build.py resolves BUILD_BASE from the environment when
+  # set, and the cache path has to agree with it.
+  BUILD_BASE: /home/runner/work/blender_build_android
+  CONFIG: ${{ inputs.config || 'full' }}
+
+jobs:
+  deps:
+    name: Dependencies (${{ inputs.config || 'full' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Free disk space
+        run: |
+          # The images ship large SDK/runtime dirs this build never uses.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
+            curl wget xz-utils zip unzip yasm nasm \
+            autoconf automake libtool pkg-config flex bison texinfo
+          # Host code generators want GCC 14+ or Clang 17+ (env.sh picks the
+          # first it finds, gcc-15 > gcc-14 > clang-18 > clang-17).
+          if ! command -v gcc-14 && ! command -v gcc-15 && \
+             ! command -v clang-17 && ! command -v clang-18; then
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update
+            sudo apt-get install -y gcc-14 g++-14 || sudo apt-get install -y clang-17 || true
+          fi
+          (gcc-14 --version || gcc --version) | head -1
+          cmake --version | head -1
+          meson --version
+
+      - name: Install host Python 3.13
+        run: |
+          # Ubuntu 24.04 ships 3.12; the numpy cross-build and USD's Python
+          # support need the 3.13 the target profile ships (deps/build.sh's
+          # host_python() finds it through `command -v python3.13`).
+          if ! command -v python3.13; then
+            sudo add-apt-repository -y ppa:deadsnakes/ppa
+            sudo apt-get update
+            sudo apt-get install -y python3.13 python3.13-dev
+          fi
+          python3.13 --version
+
+      - name: Fetch lib/linux_x64 (host libraries for the code generators)
+        run: |
+          # The submodule is `update = none`, so name it explicitly. Gitea
+          # serves the prebuilt host libraries publicly; the credential helper
+          # keeps any LFS prompt from hanging an unattended run.
+          git config --global credential.helper '!f() { echo username=; echo password=; }; f'
+          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          du -sh lib/linux_x64
+
+      - name: Cross-compile dependencies
+        run: |
+          build_files/android/deps/build.sh all
+          du -sh "$BUILD_BASE/lib/android_arm64"
+
+      - name: Cache the dependency prefix
+        uses: actions/cache/save@v4
+        with:
+          # Keyed to this run: the apk job of the same run restores exactly
+          # what this job produced, so the two can never disagree.
+          key: blender-android-deps-${{ github.run_id }}
+          path: |
+            /home/runner/work/blender_build_android/lib
+          enableCrossOsArchive: true
+
+  apk:
+    name: Blender + APK (${{ inputs.config || 'full' }})
+    runs-on: ubuntu-24.04
+    needs: deps
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ patchelf meson cmake ninja-build git-lfs \
+            curl wget xz-utils zip unzip yasm nasm \
+            autoconf automake libtool pkg-config flex bison texinfo \
+            openjdk-17-jdk-headless
+          if ! command -v gcc-14 && ! command -v gcc-15 && \
+             ! command -v clang-17 && ! command -v clang-18; then
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update
+            sudo apt-get install -y gcc-14 g++-14 || sudo apt-get install -y clang-17 || true
+          fi
+          (gcc-14 --version || gcc --version) | head -1
+          # env.sh's default JAVA_HOME on Linux; verify it is where apt put it.
+          ls -d /usr/lib/jvm/java-17-openjdk-amd64
+
+      - name: Install host Python 3.13
+        run: |
+          if ! command -v python3.13; then
+            sudo add-apt-repository -y ppa:deadsnakes/ppa
+            sudo apt-get update
+            sudo apt-get install -y python3.13 python3.13-dev
+          fi
+          python3.13 --version
+
+      - name: Fetch lib/linux_x64 (host libraries for the code generators)
+        run: |
+          git config --global credential.helper '!f() { echo username=; echo password=; }; f'
+          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          du -sh lib/linux_x64
+
+      - name: Restore the dependency prefix
+        uses: actions/cache/restore@v4
+        with:
+          key: blender-android-deps-${{ github.run_id }}
+          path: |
+            /home/runner/work/blender_build_android/lib
+          enableCrossOsArchive: true
+          fail-on-cache-miss: false
+
+      - name: Build the dependency prefix if the cache missed
+        run: |
+          # hashFiles() cannot see outside the workspace, so test the prefix
+          # itself: an empty or absent directory means the restore found nothing.
+          if [ -z "$(ls -A "$BUILD_BASE/lib/android_arm64" 2>/dev/null)" ]; then
+            echo "[ci] no cached prefix; building dependencies here (this is the slow path)"
+            build_files/android/deps/build.sh all
+          else
+            echo "[ci] cached dependency prefix restored"
+          fi
+
+      - name: Install the Android SDK and NDK
+        run: |
+          set -eux
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdline-tools.zip -d "$HOME/android-sdk/cmdline-tools"
+          rm -rf "$HOME/android-sdk/cmdline-tools/latest"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android-sdk" --licenses >/dev/null || true
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android-sdk" \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.1" \
+            "ndk;28.2.13676358"
+          ls "$HOME/android-sdk/ndk"
+
+      - name: Build Blender and package the APK
+        run: |
+          # --repackage is required for any change under scripts/ or
+          # release/datafiles (the MCP add-on lives there); it also builds the
+          # config-matched host code generators, which a version or DNA change
+          # would otherwise leave stale.
+          python3 build_files/android/build.py "$CONFIG" --repackage
+          APK="$(ls "$BUILD_BASE"/android_apk_stage_"$CONFIG"/blender-"$CONFIG".apk)"
+          ls -lh "$APK"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-${{ env.CONFIG }}-apk
+          path: /home/runner/work/blender_build_android/android_apk_stage_${{ env.CONFIG }}/blender-${{ env.CONFIG }}.apk
+          if-no-files-found: error
+          retention-days: 14

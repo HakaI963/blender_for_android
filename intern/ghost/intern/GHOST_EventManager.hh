@@ -10,6 +10,7 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <vector>
 
 #include "GHOST_IEventConsumer.hh"
@@ -113,6 +114,18 @@ class GHOST_EventManager {
   /** The event stack. */
   TEventStack events_;
   TEventStack handled_events_;
+
+  /**
+   * Serializes access to #events_ and #handled_events_.
+   *
+   * On Android the frame loop runs on a dedicated Blender thread while the
+   * activity's main thread keeps pumping the Android looper and pushes input
+   * events into the queue (see GHOST_AndroidMain.cc), so the stacks are
+   * written from two threads. Events are dispatched from the Blender thread
+   * only, and dispatch happens with the lock released because consumers may
+   * push further events while handling one.
+   */
+  std::mutex events_mutex_;
 
   /** A vector with event consumers. */
   using TConsumerVector = std::vector<GHOST_IEventConsumer *>;

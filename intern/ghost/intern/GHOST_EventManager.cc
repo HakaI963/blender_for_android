@@ -30,11 +30,13 @@ GHOST_EventManager::~GHOST_EventManager()
 
 uint32_t GHOST_EventManager::getNumEvents()
 {
+  std::scoped_lock lock(events_mutex_);
   return uint32_t(events_.size());
 }
 
 uint32_t GHOST_EventManager::getNumEvents(GHOST_TEventType type)
 {
+  std::scoped_lock lock(events_mutex_);
   uint32_t numEvents = 0;
   TEventStack::iterator p;
   for (p = events_.begin(); p != events_.end(); ++p) {
@@ -49,6 +51,7 @@ GHOST_TSuccess GHOST_EventManager::pushEvent(std::unique_ptr<const GHOST_IEvent>
 {
   GHOST_TSuccess success;
   GHOST_ASSERT(event, "invalid event");
+  std::scoped_lock lock(events_mutex_);
   if (events_.size() < events_.max_size()) {
     events_.push_front(std::move(event));
     success = GHOST_kSuccess;
@@ -61,6 +64,10 @@ GHOST_TSuccess GHOST_EventManager::pushEvent(std::unique_ptr<const GHOST_IEvent>
 
 void GHOST_EventManager::dispatchEvent(const GHOST_IEvent *event)
 {
+  /* Consumers are only modified while adding/removing windows, which happens
+   * on the thread that runs the frame loop. Events may be pushed by a consumer
+   * while one is being dispatched, so this must be called with #events_mutex_
+   * released (see #dispatchEvents). */
   TConsumerVector::iterator iter;
 
   for (iter = consumers_.begin(); iter != consumers_.end(); ++iter) {
@@ -70,18 +77,35 @@ void GHOST_EventManager::dispatchEvent(const GHOST_IEvent *event)
 
 void GHOST_EventManager::dispatchEvent()
 {
-  std::unique_ptr<const GHOST_IEvent> event = std::move(events_.back());
-  events_.pop_back();
-  const GHOST_IEvent *event_ptr = event.get();
-  handled_events_.push_back(std::move(event));
-
-  dispatchEvent(event_ptr);
+  std::unique_ptr<const GHOST_IEvent> event;
+  {
+    std::scoped_lock lock(events_mutex_);
+    if (events_.empty()) {
+      return;
+    }
+    event = std::move(events_.back());
+    events_.pop_back();
+    handled_events_.push_back(std::move(event));
+  }
+  dispatchEvent(handled_events_.back().get());
 }
 
 void GHOST_EventManager::dispatchEvents()
 {
-  while (!events_.empty()) {
-    dispatchEvent();
+  for (;;) {
+    std::unique_ptr<const GHOST_IEvent> event;
+    {
+      std::scoped_lock lock(events_mutex_);
+      if (events_.empty()) {
+        break;
+      }
+      event = std::move(events_.back());
+      events_.pop_back();
+      handled_events_.push_back(std::move(event));
+    }
+    /* Dispatched with the lock released: a consumer can call pushEvent() while
+     * handling an event (an input handler can synthesize the next one). */
+    dispatchEvent(handled_events_.back().get());
   }
 
   disposeEvents();
@@ -127,6 +151,7 @@ GHOST_TSuccess GHOST_EventManager::removeConsumer(GHOST_IEventConsumer *consumer
 
 void GHOST_EventManager::removeWindowEvents(const GHOST_IWindow *window)
 {
+  std::scoped_lock lock(events_mutex_);
   TEventStack::iterator iter;
   iter = events_.begin();
   while (iter != events_.end()) {
@@ -149,6 +174,7 @@ void GHOST_EventManager::removeWindowEvents(const GHOST_IWindow *window)
 
 void GHOST_EventManager::removeTypeEvents(GHOST_TEventType type, const GHOST_IWindow *window)
 {
+  std::scoped_lock lock(events_mutex_);
   TEventStack::iterator iter;
   iter = events_.begin();
   while (iter != events_.end()) {
@@ -171,6 +197,7 @@ void GHOST_EventManager::removeTypeEvents(GHOST_TEventType type, const GHOST_IWi
 
 void GHOST_EventManager::disposeEvents()
 {
+  std::scoped_lock lock(events_mutex_);
   while (handled_events_.empty() == false) {
     GHOST_ASSERT(handled_events_[0], "invalid event");
     handled_events_[0].reset();
