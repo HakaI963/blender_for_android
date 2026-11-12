@@ -12,6 +12,12 @@
 # alone starts from the cached prefix instead of paying for both halves again,
 # and each half stays inside the 6-hour job limit.
 #
+# The dependency cache is keyed by a hash of the recipes and their versions, not
+# by the run: an unchanged recipe set restores what any earlier run built, and
+# `deps/build.sh all` skips every library whose install directory already has
+# content, so a warm deps job is minutes rather than hours. A prefix fallback
+# (`restore-keys`) picks up a cache written under an older key.
+#
 # Triggers: a push to main, or Run workflow from the Actions tab (config: full
 # or lite). The artifact is the same debug-signed development APK the local
 # build produces -- installable as-is.
@@ -49,6 +55,10 @@ env:
   # environment, and the cache path has to agree with it.
   BUILD_BASE: /home/runner/work/blender_build_android
   CONFIG: ${{ inputs.config || 'full' }}
+  # Hash of what actually determines the dependency prefix: the recipe script
+  # and the version manifest. Kept out of the job steps so both jobs derive the
+  # same key from the same files.
+  DEPS_CACHE_KEY: ${{ hashFiles('build_files/android/deps/build.sh', 'build_files/build_environment/cmake/versions.cmake') }}
   # Own the Android toolchain locations, so the image's exported Android
   # variables cannot redirect the build.
   ANDROID_HOME: /home/runner/android-sdk
@@ -137,19 +147,34 @@ jobs:
             "ndk;${ANDROID_NDK_VERSION}"
           ls "$ANDROID_HOME/ndk"
 
+      - name: Restore the dependency prefix cache
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: blender-android-deps-${{ env.DEPS_CACHE_KEY }}
+          restore-keys: |
+            blender-android-deps-
+          path: |
+            /home/runner/work/blender_build_android/lib
+          enableCrossOsArchive: true
+          fail-on-cache-miss: false
+
       - name: Cross-compile dependencies
         run: |
-          # The scripts are committed non-executable (mode 644) and this repo's
-          # own convention is to run them through bash, as build.py does.
+          # build.sh all skips every library whose install directory already has
+          # content, so a restored cache turns this into a no-op pass.
           bash build_files/android/deps/build.sh all
           du -sh "$BUILD_BASE/lib/android_arm64"
 
       - name: Cache the dependency prefix
+        # Only when the exact key was not already there: re-saving a warm prefix
+        # would double the repo's 10 GB cache budget for nothing.
+        if: steps.deps-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          # Keyed to this run: the apk job of the same run restores exactly
-          # what this job produced, so the two can never disagree.
-          key: blender-android-deps-${{ github.run_id }}
+          # Content-addressed: any later run with the same recipes and versions
+          # restores this instead of rebuilding from nothing.
+          key: blender-android-deps-${{ env.DEPS_CACHE_KEY }}
           path: |
             /home/runner/work/blender_build_android/lib
           enableCrossOsArchive: true
@@ -213,7 +238,9 @@ jobs:
       - name: Restore the dependency prefix
         uses: actions/cache/restore@v4
         with:
-          key: blender-android-deps-${{ github.run_id }}
+          key: blender-android-deps-${{ env.DEPS_CACHE_KEY }}
+          restore-keys: |
+            blender-android-deps-
           path: |
             /home/runner/work/blender_build_android/lib
           enableCrossOsArchive: true
