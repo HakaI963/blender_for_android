@@ -47,9 +47,9 @@
 
              configChanges lists everything that must not recreate the
              activity. Recreation is not a display hiccup here: it runs
-             ANativeActivity_onCreate again -- a second android_main, a second
-             Blender init inside the same process, i.e. the app visibly
-             restarts and does not "stay open in the background". The
+             ANativeActivity_onCreate again, which is a second android_main and
+             a second Blender init inside the same process; the app visibly
+             restarts instead of staying open. The
              display/theme/font entries beyond the usual four are the system
              settings that change while an app sits in the background (dark
              mode, font size, locale, layout direction) and would otherwise
