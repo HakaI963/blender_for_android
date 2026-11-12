@@ -12,11 +12,11 @@
 # alone starts from the cached prefix instead of paying for both halves again,
 # and each half stays inside the 6-hour job limit.
 #
-# The dependency cache is keyed by a hash of the recipes and their versions, not
-# by the run: an unchanged recipe set restores what any earlier run built, and
+# The dependency cache is keyed by the recipe version, not by the run: an
+# unchanged recipe set restores what any earlier run built, and
 # `deps/build.sh all` skips every library whose install directory already has
 # content, so a warm deps job is minutes rather than hours. A prefix fallback
-# (`restore-keys`) picks up a cache written under an older key.
+# (`restore-keys`) also picks up caches written under older keys.
 #
 # Triggers: a push to main, or Run workflow from the Actions tab (config: full
 # or lite). The artifact is the same debug-signed development APK the local
@@ -55,10 +55,10 @@ env:
   # environment, and the cache path has to agree with it.
   BUILD_BASE: /home/runner/work/blender_build_android
   CONFIG: ${{ inputs.config || 'full' }}
-  # Hash of what actually determines the dependency prefix: the recipe script
-  # and the version manifest. Kept out of the job steps so both jobs derive the
-  # same key from the same files.
-  DEPS_CACHE_KEY: ${{ hashFiles('build_files/android/deps/build.sh', 'build_files/build_environment/cmake/versions.cmake') }}
+  # Bump the suffix when the dependency recipes or their versions change: the
+  # prefix fallback below then picks up the older prefix while the new one is
+  # built, instead of silently restoring stale libraries.
+  DEPS_CACHE_KEY: v1
   # Own the Android toolchain locations, so the image's exported Android
   # variables cannot redirect the build.
   ANDROID_HOME: /home/runner/android-sdk
