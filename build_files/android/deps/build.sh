@@ -364,10 +364,17 @@ build_minizipng() {
   local v; v="$(dep_version MINIZIPNG_VERSION)"
   fetch "minizip-ng-$v.tar.gz" "https://github.com/zlib-ng/minizip-ng/archive/$v.tar.gz"
   local src; src="$(extract "minizip-ng-$v.tar.gz" minizipng)"
+  # MZ_PPMD defaults ON in 4.2.x and builds the PPMd sources (cloned from the
+  # 7zip repo at configure time) into a *separate* static library, so
+  # mz_strm_ppmd.c.o ends up in libminizip.a while the Ppmd8_* symbols it
+  # references live in a libppmd.a nobody links -- the OpenColorIO link dies on
+  # undefined symbols when it is handed libminizip.a directly (see its find
+  # module workaround below). No consumer here reads PPMd-compressed archives;
+  # every other optional codec is off already, so turn this one off too.
   cmake_install "$src" minizipng \
     -DMZ_FETCH_LIBS=OFF -DMZ_LIBCOMP=OFF -DMZ_PKCRYPT=OFF -DMZ_WZAES=OFF \
     -DMZ_OPENSSL=OFF -DMZ_SIGNING=OFF -DMZ_LZMA=OFF -DMZ_ZSTD=OFF \
-    -DMZ_BZIP2=OFF -DMZ_ICONV=OFF
+    -DMZ_BZIP2=OFF -DMZ_ICONV=OFF -DMZ_PPMD=OFF
 }
 
 build_opencolorio() {
