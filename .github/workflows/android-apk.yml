@@ -108,7 +108,9 @@ jobs:
 
       - name: Cross-compile dependencies
         run: |
-          build_files/android/deps/build.sh all
+          # The scripts are committed non-executable (mode 644) and this repo's
+          # own convention is to run them through bash, as build.py does.
+          bash build_files/android/deps/build.sh all
           du -sh "$BUILD_BASE/lib/android_arm64"
 
       - name: Cache the dependency prefix
@@ -192,7 +194,7 @@ jobs:
           # itself: an empty or absent directory means the restore found nothing.
           if [ -z "$(ls -A "$BUILD_BASE/lib/android_arm64" 2>/dev/null)" ]; then
             echo "[ci] no cached prefix; building dependencies here (this is the slow path)"
-            build_files/android/deps/build.sh all
+            bash build_files/android/deps/build.sh all
           else
             echo "[ci] cached dependency prefix restored"
           fi
