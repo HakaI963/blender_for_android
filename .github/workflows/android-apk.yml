@@ -95,11 +95,15 @@ jobs:
 
       - name: Fetch lib/linux_x64 (host libraries for the code generators)
         run: |
-          # The submodule is `update = none`, so name it explicitly. Gitea
-          # serves the prebuilt host libraries publicly; the credential helper
-          # keeps any LFS prompt from hanging an unattended run.
+          # .gitmodules names this submodule, but the GitHub mirror never
+          # recorded the gitlink, so `git submodule update` finds no pathspec:
+          # clone the branch it names (the tip of blender-v5.3-release) straight
+          # from Gitea. The libraries are LFS objects, served publicly; the
+          # credential helper keeps an unattended LFS prompt from hanging.
           git config --global credential.helper '!f() { echo username=; echo password=; }; f'
-          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          git clone --depth 1 -b blender-v5.3-release \
+            https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
+          git -C lib/linux_x64 lfs pull || echo "[ci] no LFS objects in lib/linux_x64 (fine)"
           du -sh lib/linux_x64
 
       - name: Cross-compile dependencies
@@ -163,8 +167,14 @@ jobs:
 
       - name: Fetch lib/linux_x64 (host libraries for the code generators)
         run: |
+          # Same direct clone as the deps job: .gitmodules names the submodule
+          # but the GitHub mirror never recorded the gitlink, so `git submodule
+          # update` finds no pathspec. Gitea serves the LFS libraries publicly;
+          # the credential helper keeps an unattended LFS prompt from hanging.
           git config --global credential.helper '!f() { echo username=; echo password=; }; f'
-          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          git clone --depth 1 -b blender-v5.3-release \
+            https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
+          git -C lib/linux_x64 lfs pull || echo "[ci] no LFS objects in lib/linux_x64 (fine)"
           du -sh lib/linux_x64
 
       - name: Restore the dependency prefix
